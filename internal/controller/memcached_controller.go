@@ -50,6 +50,13 @@ const (
 	typeDegradedMemcached = "Degraded"
 )
 
+var waitTime = wait.Backoff{
+	Steps:    5,
+	Duration: 50 * time.Millisecond,
+	Factor:   2.0,
+	Jitter:   1,
+}
+
 // MemcachedReconciler reconciles a Memcached object
 type MemcachedReconciler struct {
 	client.Client
@@ -128,12 +135,7 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		log.Info("Adding Finalizer for Memcached")
 
 		// Retry on conflict
-		err := wait.ExponentialBackoff(wait.Backoff{
-			Steps:    5,
-			Duration: 5 * time.Millisecond,
-			Factor:   2.0,
-			Jitter:   0.1,
-		}, func() (bool, error) {
+		err := wait.ExponentialBackoff(waitTime, func() (bool, error) {
 			// Re-fetch the resource to get the latest version
 			if err := r.Get(ctx, req.NamespacedName, memcached); err != nil {
 				log.Error(err, "Failed to re-fetch memcached")
@@ -178,12 +180,7 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			})
 
 			// Retry on conflict
-			err := wait.ExponentialBackoff(wait.Backoff{
-				Steps:    5,
-				Duration: 5 * time.Millisecond,
-				Factor:   2.0,
-				Jitter:   0.1,
-			}, func() (done bool, err error) {
+			err := wait.ExponentialBackoff(waitTime, func() (done bool, err error) {
 				if err := r.Status().Update(ctx, memcached); err != nil {
 					if apierrors.IsConflict(err) {
 						// Return false to retry
@@ -325,13 +322,7 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	if err = wait.ExponentialBackoff(wait.Backoff{
-		Steps:    10,
-		Duration: 2 * time.Second,
-		Factor:   2.0,
-		Jitter:   1,
-	}, func() (done bool, err error) {
-		fmt.Println("setting status")
+	if err = wait.ExponentialBackoff(waitTime, func() (done bool, err error) {
 		if err := r.Get(ctx, req.NamespacedName, memcached); err != nil {
 			log.Error(err, "Failed to re-fetch memcached")
 			return false, err
@@ -354,7 +345,6 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}); err != nil {
 		fmt.Println(err, "Failed to update Memcached status")
 	}
-	fmt.Println("Changed status")
 	return ctrl.Result{}, nil
 }
 
