@@ -30,6 +30,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -125,14 +126,40 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/finalizers
 	if !controllerutil.ContainsFinalizer(memcached, memcachedFinalizer) {
 		log.Info("Adding Finalizer for Memcached")
-		if ok := controllerutil.AddFinalizer(memcached, memcachedFinalizer); !ok {
-			log.Error(err, "Failed to add finalizer into the custom resource")
-			return ctrl.Result{Requeue: true}, nil
-		}
 
-		if err = r.Update(ctx, memcached); err != nil {
-			log.Error(err, "Failed to update custom resource to add finalizer")
-			return ctrl.Result{}, err
+		// Retry on conflict
+		err := wait.ExponentialBackoff(wait.Backoff{
+			Steps:    5,
+			Duration: 5 * time.Millisecond,
+			Factor:   2.0,
+			Jitter:   0.1,
+		}, func() (bool, error) {
+			// Re-fetch the resource to get the latest version
+			if err := r.Get(ctx, req.NamespacedName, memcached); err != nil {
+				log.Error(err, "Failed to re-fetch memcached")
+				return false, err
+			}
+
+			controllerutil.AddFinalizer(memcached, memcachedFinalizer)
+
+			// Attempt to update the resource
+			if err := r.Update(ctx, memcached); err != nil {
+				if apierrors.IsConflict(err) {
+					// Return false to retry
+					log.Info("Conflict detected, retrying update")
+					return false, nil
+				}
+				// For other errors, return true with error to stop retrying
+				log.Error(err, "Failed to update custom resource to add finalizer")
+				return true, err
+			}
+
+			// If update was successful, return true
+			return true, nil
+		})
+		if err != nil {
+			log.Error(err, "Failed to add finalizer after retries")
+			return ctrl.Result{Requeue: true}, err
 		}
 	}
 
@@ -150,10 +177,24 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 				Message: fmt.Sprintf("Performing finalizer operations for the custom resource: %s ", memcached.Name),
 			})
 
-			if err := r.Status().Update(ctx, memcached); err != nil {
-				log.Error(err, "Failed to update Memcached status")
-				return ctrl.Result{}, err
-			}
+			// Retry on conflict
+			err := wait.ExponentialBackoff(wait.Backoff{
+				Steps:    5,
+				Duration: 5 * time.Millisecond,
+				Factor:   2.0,
+				Jitter:   0.1,
+			}, func() (done bool, err error) {
+				if err := r.Status().Update(ctx, memcached); err != nil {
+					if apierrors.IsConflict(err) {
+						// Return false to retry
+						log.Info("Conflict detected, retrying update")
+						return false, nil
+					}
+					log.Error(err, "Failed to update Memcached status")
+					return true, err
+				}
+				return true, nil
+			})
 
 			// Perform all operations required before removing the finalizer and allow
 			// the Kubernetes API to remove the custom resource.
@@ -168,6 +209,10 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			// raising the error "the object has been modified, please apply
 			// your changes to the latest version and try again" which would re-trigger the reconciliation
 			if err := r.Get(ctx, req.NamespacedName, memcached); err != nil {
+				if apierrors.IsNotFound(err) {
+					log.Info("Object not present")
+					return ctrl.Result{}, nil
+				}
 				log.Error(err, "Failed to re-fetch memcached")
 				return ctrl.Result{}, err
 			}
@@ -280,18 +325,36 @@ func (r *MemcachedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return ctrl.Result{Requeue: true}, nil
 	}
 
-	// The following implementation will update the status
-	meta.SetStatusCondition(&memcached.Status.Conditions, metav1.Condition{
-		Type:   typeAvailableMemcached,
-		Status: metav1.ConditionTrue, Reason: "Reconciling",
-		Message: fmt.Sprintf("Deployment for custom resource (%s) with %d replicas created successfully", memcached.Name, size),
-	})
-
-	if err := r.Status().Update(ctx, memcached); err != nil {
-		log.Error(err, "Failed to update Memcached status")
-		return ctrl.Result{}, err
+	if err = wait.ExponentialBackoff(wait.Backoff{
+		Steps:    10,
+		Duration: 2 * time.Second,
+		Factor:   2.0,
+		Jitter:   1,
+	}, func() (done bool, err error) {
+		fmt.Println("setting status")
+		if err := r.Get(ctx, req.NamespacedName, memcached); err != nil {
+			log.Error(err, "Failed to re-fetch memcached")
+			return false, err
+		}
+		// The following implementation will update the status
+		meta.SetStatusCondition(&memcached.Status.Conditions, metav1.Condition{
+			Type:   typeAvailableMemcached,
+			Status: metav1.ConditionTrue, Reason: "Reconciling",
+			Message: fmt.Sprintf("Deployment for custom resource (%s) with %d replicas created successfully", memcached.Name, size),
+		})
+		if err := r.Status().Update(ctx, memcached); err != nil {
+			if apierrors.IsConflict(err) {
+				log.Info("Conflict detected, retrying update: set status condition")
+				fmt.Println(err)
+				return false, nil
+			}
+			return true, err
+		}
+		return true, nil
+	}); err != nil {
+		fmt.Println(err, "Failed to update Memcached status")
 	}
-
+	fmt.Println("Changed status")
 	return ctrl.Result{}, nil
 }
 
